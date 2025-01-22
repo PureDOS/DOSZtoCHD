@@ -1,0 +1,3 @@
+echo Building \'DOSZtoCHD-`uname -m`\' ...
+clang -std=c++11 DOSZtoCHD.cpp -lstdc++ -Wall -o DOSZtoCHD-`uname -m`
+echo Done!
