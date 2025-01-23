@@ -133,7 +133,6 @@ static std::string& PathSetFileExt(std::string& path, const char* ext)
 struct SFile
 {
 	std::string path; Bit64u size; Bit16u date, time;
-	enum : Bit8u { T_RAW, T_MEMORY, T_ZIP, T_ISO, T_FAT } typ;
 	inline SFile() : date(0), time(0) { }
 	virtual inline ~SFile() { }
 	virtual bool Open() = 0;
@@ -148,7 +147,6 @@ struct SFileRaw : SFile
 	FILE* f;
 	inline SFileRaw(std::string& _path, bool isdir) : SFile(), f(NULL)
 	{
-		typ = T_RAW;
 		path.swap(_path);
 		if (!stat_utf8(path.c_str(), date, time)) { size = 0; return; }
 		if (isdir) { path += '/'; size = 0; return; }
@@ -167,7 +165,7 @@ struct SFileRaw : SFile
 struct SFileMemory : SFile
 {
 	Bit8u* buf; Bit64u pos;
-	inline SFileMemory(Bit64u _size) : buf(_size ? (Bit8u*)malloc((size_t)_size) : (Bit8u*)NULL), pos((Bit64u)-1) { typ = T_MEMORY; size = _size; }
+	inline SFileMemory(Bit64u _size) : buf(_size ? (Bit8u*)malloc((size_t)_size) : (Bit8u*)NULL), pos((Bit64u)-1) { size = _size; }
 	virtual inline ~SFileMemory() { free(buf); }
 	virtual bool Open() { ZIP_ASSERT(pos == (Bit64u)-1 && size); pos = 0; return true; }
 	virtual bool IsOpen() { return (pos != (Bit64u)-1); }
@@ -196,7 +194,6 @@ struct SFileZip : SFileMemory
 	SFileZip(ZipReader& _reader, const char* filename, Bit32u filename_len, Bit64u _data_ofs, Bit32u _comp_size, Bit64u _decomp_size, Bit16u _date, Bit16u _time, Bit8u _bit_flags, Bit8u _method)
 		: SFileMemory(0), reader(_reader), unpacked(0), data_ofs(_data_ofs), comp_size(_comp_size), bit_flags(_bit_flags), method(_method), lhskip(false), decomp_state(NULL)
 	{
-		typ = T_ZIP;
 		(path.assign(reader.archive.path) += '/').append(filename, (size_t)filename_len);
 		size = _decomp_size;
 		date = _date;
@@ -400,28 +397,23 @@ struct ISOGenerator
 	{
 		PathRecord() {}
 		Bit8u nameLen, extAttrLen, dirSector[4], parentNumber[2], name[222];
-		Bit32u _parentDirRecordIndex, _DirRecordStart, _DirRecordEnd, _DirRecordSectors, _DirSector; Bit16u _ParentNumber;
+		Bit32u _parentPathIndex, _DirRecordStart, _DirRecordEnd, _DirRecordSectors, _DirSector;
 		inline Bit8u RecordLen() { return (Bit8u)(8 + ((nameLen + 1) & ~1)); } // pad to even byte numbers
 		inline void Pad() { if (nameLen & 1) name[nameLen] = '\0'; } // pad to even byte numbers
 	};
 	struct DirRecord
 	{
-		enum : Bit8u { FLAG_DIR = 2 };
+		enum : Bit8u { FLAG_DIR = 2, RECORD_LEN_BASE = 33 };
 		Bit8u recordLen, extAttrLen, dataSector[8], dataSize[8], dateY, dateM, dateD, timeH, timeM, timeS, timeZone, fileFlags, fileUnitSize, interleaveGapSize, VolumeSeqNumber[4], nameLen, name[222];
-		Bit32u _fileOrPathIndex;
+		Bit32u _fileIndex, _pathIndex;
 		DirRecord() {}
-		DirRecord(SFile** sf, Bit32u fileOrPathIndex, bool isDir, const char* _name, Bit8u _nameLen)
+		DirRecord(SFile* sf, Bit32u fileIndex, Bit32u pathIndex, bool isDir, const char* _name, Bit8u _nameLen) : _fileIndex(fileIndex), _pathIndex(pathIndex)
 		{
-			recordLen = 33 + _nameLen + (1 - (_nameLen & 1)); // pad to even byte numbers
+			recordLen = RECORD_LEN_BASE + _nameLen + (1 - (_nameLen & 1)); // pad to even byte numbers
 			extAttrLen = 0;
-			Bit32u siz = (Bit32u)(sf ? (*sf)->size : 0), dat =  (sf ? (*sf)->date : 0), tim =  (sf ? (*sf)->time : 0);
+			Bit32u siz = (Bit32u)(sf ? sf->size : 0);
 			ZIP_WRITE_LB32(dataSize, siz);
-			dateY = (Bit8u)((dat >> 9) + 80); // year
-			dateM = (Bit8u)((dat >> 5) & 0xf); // month;
-			dateD = (Bit8u)(dat & 0x1f); // day;
-			timeH = (Bit8u)(tim >> 11); // hour;
-			timeM = (Bit8u)((tim >> 5) & 0x3f); // minute;
-			timeS = (Bit8u)((tim & 0x1f) * 2); // second;
+			SetDate((sf ? sf->date : 0), (sf ? sf->time : 0));
 			timeZone = 0; // gmtOffset;
 			fileFlags = (isDir ? FLAG_DIR : 0); // file flags
 			fileUnitSize = 0; // interleaved mode file unit size;
@@ -429,9 +421,9 @@ struct ISOGenerator
 			ZIP_WRITE_LB16(VolumeSeqNumber, 1); // volume sequence number
 			nameLen = _nameLen;
 			memcpy(name, _name, _nameLen);
-			if (!(_nameLen & 1)) name[_nameLen] = '\0'; 
-			_fileOrPathIndex = fileOrPathIndex;
+			if (!(_nameLen & 1)) name[_nameLen] = '\0'; // pad
 		}
+		void SetDate(Bit16u dat, Bit16u tim) { dateY = (Bit8u)((dat>>9)+80); dateM = (Bit8u)((dat>>5)&0xf); dateD = (Bit8u)(dat&0x1f); timeH = (Bit8u)(tim>>11); timeM = (Bit8u)((tim>>5)&0x3f); timeS = (Bit8u)((tim&0x1f)*2); }
 	};
 
 	enum { CHD_V5_HEADER_SIZE = 124, CHD_V5_UNCOMPMAPENTRYBYTES = 4, CHD_METADATA_HEADER_SIZE = 16, CHD_CDROM_TRACK_METADATA2_TAG = 1128813618, CHD_CD_TRACK_PADDING = 4 };
@@ -622,30 +614,26 @@ struct ISOGenerator
 		numSectors++;
 	}
 
-	void FillDir(SFile** sf, SFile** sfBegin, SFile** sfEnd, size_t baseLen, Bit8u dirNameLen, Bit16u parentNumber, Bit32u parentDirRecordIndex, DirRecord* drParent)
+	void FillDir(SFile** sf, SFile** sfBegin, SFile** sfEnd, size_t baseLen, Bit8u dirNameLen = 0, const DirRecord* parentDot = NULL, Bit32u parentPathIndex = 0, Bit32u parentDirRecordIndex = (Bit32u)-1)
 	{
 		ZIP_ASSERT(!sf || ((*sf)->path[baseLen] == '/' && (*sf)->path[baseLen-1] != '/' && (*sf)->path[baseLen+1] != '/'));
-		//if (sf) printf("DIR [%8.*s]/[%-8.*s] (First File:  %s)\n", (drParent ? pathRecords[drParent->_fileOrPathIndex].nameLen : 0), (drParent ? (char*)pathRecords[drParent->_fileOrPathIndex].name : ""), dirNameLen, (*sf)->path.c_str() + baseLen - dirNameLen, (*sf)->path.c_str());
+		//if (sf) printf("DIR [%8.*s]/[%-8.*s] (First File:  %s)\n", (parentDot ? pathRecords[parentDot->_pathIndex].nameLen : 0), (parentDot ? (char*)pathRecords[parentDot->_pathIndex].name : ""), dirNameLen, (*sf)->path.c_str() + baseLen - dirNameLen, (*sf)->path.c_str());
 
 		PathRecord pr;
 		pr.nameLen = (dirNameLen ? dirNameLen : 1);
 		pr.extAttrLen = 0;
-		pr._ParentNumber = parentNumber;
 		memcpy(pr.name, (dirNameLen ? (*sf)->path.c_str() + baseLen - dirNameLen : "\0"), pr.nameLen);
 		pr.Pad();
 		pathTableSize += pr.RecordLen();
-		pr._parentDirRecordIndex = parentDirRecordIndex;
+		pr._parentPathIndex = parentPathIndex;
 		pr._DirRecordStart = (Bit32u)dirRecords.size();
 
-		DirRecord drDot(sf, (Bit32u)pathRecords.size(), true, "\0", (Bit8u)1), drDotDot = (drParent ? *drParent : drDot);
-		ZIP_ASSERT(drDot.recordLen == drDotDot.recordLen);
-		drDotDot.name[0] = '\x01';
-		dirRecords.push_back(drDot);
-		dirRecords.push_back(drDotDot);
-
-		Bit32u dirSectors = 1, dirBytesLeft = ISO_FRAMESIZE - drDotDot.recordLen - drDot.recordLen;
+		SFile* sfMaxDate = NULL; // use highest time stamp of a recursively contained file (ignore unreliable directory timestamps)
+		Bit32u dirSectors = 1, dirBytesLeft = (ISO_FRAMESIZE - ((DirRecord::RECORD_LEN_BASE + 1) * 2)); // dot and dotdot records already used
+		dirRecords.resize(dirRecords.size() + 2);
 		if (sf) for (const char *curName, *curNameEnd, *lastName = NULL, *lastNameEnd = NULL;; lastName = curName, lastNameEnd = curNameEnd)
 		{
+			if ((!sfMaxDate || ((*sf)->date > sfMaxDate->date || ((*sf)->date == sfMaxDate->date && (*sf)->time > sfMaxDate->time))) && (*sf)->path.back() != '/') sfMaxDate = *sf;
 			const char *sfPath = (*sf)->path.c_str();
 			curName = sfPath + baseLen + 1;
 			const char *dirTerm = strchr(curName, '/');
@@ -653,27 +641,33 @@ struct ISOGenerator
 			size_t nameLen = (curNameEnd - curName);
 			if (nameLen && nameLen < sizeof(((DirRecord*)sf)->name) && (nameLen != (size_t)(lastNameEnd - lastName) || memcmp(curName, lastName, nameLen)))
 			{
-				dirRecords.emplace_back(sf, (Bit32u)(sf - sfBegin), !!dirTerm, curName, (Bit8u)nameLen);
-				fileSectors += (Bit32u)((*sf)->size + (ISO_FRAMESIZE-1)) / ISO_FRAMESIZE;
+				//printf("    %s [%.*s] Size: %u\n", (!!dirTerm ? "SDIR" : "FILE"), nameLen, curName, (*sf)->size);
+				dirRecords.emplace_back(*sf, (Bit32u)(sf - sfBegin), (Bit32u)-1, !!dirTerm, curName, (Bit8u)nameLen);
+				if (!dirTerm) fileSectors += (Bit32u)((*sf)->size + (ISO_FRAMESIZE-1)) / ISO_FRAMESIZE;
 				Bit32u drLen = dirRecords.back().recordLen;
 				if (dirBytesLeft < drLen) { dirSectors++; dirBytesLeft = ISO_FRAMESIZE - drLen; } else dirBytesLeft -= drLen;
 			}
-			if (++sf == sfEnd || (*sf)->path.length() <= baseLen || memcmp((*sf)->path.c_str(), sfPath, baseLen + 1)) break;;
+			if (++sf == sfEnd || (*sf)->path.length() <= baseLen || memcmp((*sf)->path.c_str(), sfPath, baseLen + 1)) break;
 		}
 
+		Bit32u pathIndex = (Bit32u)pathRecords.size();
 		pr._DirRecordEnd = (Bit32u)dirRecords.size();
 		pr._DirRecordSectors = dirSectors;
 		pathRecords.push_back(pr);
-		Bit16u prNumber = (Bit16u)pathRecords.size();
 		dirRecordSectors += dirSectors;
+
+		DirRecord drDot(sfMaxDate, (Bit32u)-1, pathIndex, true, "\0", (Bit8u)1);
+		dirRecords[pr._DirRecordStart + 0] = drDot;
+		dirRecords[pr._DirRecordStart + 1] = (parentDot ? *parentDot : drDot);
+		dirRecords[pr._DirRecordStart + 1].name[0] = '\x01';
+		if (parentDot) dirRecords[parentDirRecordIndex].SetDate((sfMaxDate ? sfMaxDate->date : 0), (sfMaxDate ? sfMaxDate->time : 0));
 
 		for (Bit32u i = pr._DirRecordStart + 2, iEnd = pr._DirRecordEnd; i != iEnd; i++)
 		{
 			DirRecord& dr = dirRecords[i];
 			if (!(dr.fileFlags & DirRecord::FLAG_DIR)) continue;
-			sf = sfBegin + dr._fileOrPathIndex;
-			dr._fileOrPathIndex = (Bit32u)pathRecords.size();
-			FillDir(sf, sfBegin, sfEnd, baseLen + 1 + dr.nameLen, dr.nameLen, prNumber, i, &drDot);
+			dr._pathIndex = (Bit32u)pathRecords.size();
+			FillDir(sfBegin + dr._fileIndex , sfBegin, sfEnd, baseLen + 1 + dr.nameLen, dr.nameLen, &drDot, pathIndex, i);
 		}
 	}
 
@@ -712,7 +706,7 @@ struct ISOGenerator
 		ZIP_ASSERT(dirRecords[0].recordLen == 34 && (dirRecords[0].fileFlags & DirRecord::FLAG_DIR) && dirRecords[0].name[0] == '\0');
 		ZIP_WRITE_LB32(dirRecords[0].dataSector, firstDirRecordSector);
 		ZIP_WRITE_LB32(dirRecords[0].dataSize, pathRecords[0]._DirRecordSectors * ISO_FRAMESIZE);
-		memcpy(sec+156, &dirRecords[0], 34);
+		memcpy(sec+156, &dirRecords[0], DirRecord::RECORD_LEN_BASE + 1);
 		memset(sec+190, ' ', 128); // set id
 		memset(sec+318, ' ', 128); // publisher id
 		memset(sec+446, ' ', 128); // preparer id
@@ -733,20 +727,21 @@ struct ISOGenerator
 
 		PathRecord *prBegin = &pathRecords[0], *prEnd = prBegin + pathRecords.size();
 		Bit32u dirSec = firstDirRecordSector;
-		for (PathRecord* pr = prBegin; pr != prEnd; dirSec += (pr++)->_DirRecordSectors)
-			pr->_DirSector = dirSec;
+		for (PathRecord* pr = prBegin; pr != prEnd; dirSec += (pr++)->_DirRecordSectors) pr->_DirSector = dirSec;
+		ZIP_ASSERT(dirSec == firstFileDataSector);
 
 		Log("Writing %u path records ...\n", (unsigned)pathRecords.size());
-		for (Bit32u tableEndianness = 0; tableEndianness != 2; tableEndianness++)
+		for (Bit32u tableBE = 0; tableBE != 2; tableBE++)
 		{
-			ZIP_ASSERT(numSectors == (!tableEndianness ? lePathTableSector : bePathTableSector));
+			ZIP_ASSERT(numSectors == (!tableBE ? lePathTableSector : bePathTableSector));
 			Bit32u ofs = 0, remain = ISO_FRAMESIZE;
 			for (PathRecord* pr = prBegin; pr != prEnd; remain = ISO_FRAMESIZE)
 			{
 				while (remain && pr != prEnd)
 				{
-					if (!tableEndianness) { ZIP_WRITE_LE32(pr->dirSector, pr->_DirSector); ZIP_WRITE_LE16(pr->parentNumber, pr->_ParentNumber) }
-					else                  { ZIP_WRITE_BE32(pr->dirSector, pr->_DirSector); ZIP_WRITE_BE16(pr->parentNumber, pr->_ParentNumber) }
+					Bit16u parentNumber = (Bit16u)(pr->_parentPathIndex + 1);
+					if (!tableBE) { ZIP_WRITE_LE32(pr->dirSector, pr->_DirSector); ZIP_WRITE_LE16(pr->parentNumber, parentNumber) }
+					else          { ZIP_WRITE_BE32(pr->dirSector, pr->_DirSector); ZIP_WRITE_BE16(pr->parentNumber, parentNumber) }
 					Bit32u step = (pr->RecordLen() - ofs);
 					if (remain >= step) { memcpy((sec+ISO_FRAMESIZE)-remain, ((Bit8u*)pr) + ofs, step  ); ofs =      0; remain -= step; pr++; }
 					else                { memcpy((sec+ISO_FRAMESIZE)-remain, ((Bit8u*)pr) + ofs, remain); ofs = remain; remain  = 0; }
@@ -768,7 +763,7 @@ struct ISOGenerator
 				{
 					if (dr->fileFlags & DirRecord::FLAG_DIR)
 					{
-						PathRecord* subpr = &pathRecords[dr->_fileOrPathIndex];
+						PathRecord* subpr = &pathRecords[dr->_pathIndex];
 						ZIP_WRITE_LB32(dr->dataSector, subpr->_DirSector);
 						ZIP_WRITE_LB32(dr->dataSize, subpr->_DirRecordSectors * ISO_FRAMESIZE);
 					}
@@ -783,14 +778,14 @@ struct ISOGenerator
 				AddSector(ISO_FRAMESIZE-remain);
 			}
 		}
-		ZIP_ASSERT(numSectors == firstFileDataSector);
+		ZIP_ASSERT(numSectors == firstFileDataSector && fileSec == totalISOSectors);
 
 		Log("Writing file contents ...\n");
 		for (DirRecord *dr = &dirRecords[0], *drEnd = &dirRecords[0] + dirRecords.size(); dr != drEnd; dr++)
 		{
 			if ((dr->fileFlags & DirRecord::FLAG_DIR) || !ZIP_READ_LE32(dr->dataSize)) continue;
 			ZIP_ASSERT(numSectors == ZIP_READ_LE32(dr->dataSector));
-			SFile* fi = files[dr->_fileOrPathIndex];
+			SFile* fi = files[dr->_fileIndex];
 			fi->Open();
 			for (Bit64u step; (step = fi->Read(sec, ISO_FRAMESIZE)) != 0;) AddSector((size_t)step);
 			fi->Close();
@@ -848,7 +843,7 @@ struct ISOGenerator
 		SFile** sfBegin = (!files.empty() ? &files[0] : NULL);
 		ISOGenerator* iso = new ISOGenerator();
 		Log("Preparing CD-ROM ISO 9660 Structure ...\n");
-		iso->FillDir(sfBegin, sfBegin, sfBegin + files.size(), basePathLen, 0, 1, 0, NULL);
+		iso->FillDir(sfBegin, sfBegin, sfBegin + files.size(), basePathLen);
 		iso->mode = mode;
 		iso->fiso = ffiso;
 		iso->DoOutput(files, label);
