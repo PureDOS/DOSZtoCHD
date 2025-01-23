@@ -879,7 +879,7 @@ int main(int argc, char *argv[])
 			"  [-o] <PATH>: Path to output file with CHD/CUE/ISO extension (optional, defaults to input file with a CHD extension)\n"
 			"  -l <LABEL> : Specify label\n"
 			"  -f         : Force overwrite existing files\n"
-			"\n", "DOSZtoCHD", "0.1");
+			"\n", "DOSZtoCHD", "0.2");
 		return 1;
 	}
 
